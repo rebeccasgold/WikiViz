@@ -1,0 +1,14 @@
+<project>
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>org.wikibrainapi.viz</groupId>
+  <artifactId>WikiViz</artifactId>
+  <version>1</version>
+
+  <dependencies>
+      <dependency>
+          <groupId>org.wikibrainapi</groupId>
+          <artifactId>wikibrain</artifactId>
+          <version>0.8-SNAPSHOT</version>
+      </dependency>
+  </dependencies>
+</project>
