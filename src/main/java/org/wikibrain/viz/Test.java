@@ -1,45 +1,34 @@
 package org.wikibrain.viz;
 
-import org.apache.log4j.BasicConfigurator;
-import org.apache.log4j.Logger;
+import com.google.gson.*;
+import gnu.trove.map.TIntIntMap;
 import org.joda.time.DateTime;
-import org.wikibrain.Loader;
-import org.wikibrain.conf.ConfigurationException;
-import org.wikibrain.conf.Configurator;
-import org.wikibrain.core.WikiBrainException;
+import org.slf4j.LoggerFactory;
 import org.wikibrain.core.cmd.Env;
 import org.wikibrain.core.cmd.EnvBuilder;
-import org.wikibrain.core.dao.DaoException;
-import org.wikibrain.core.dao.LocalLinkDao;
-import org.wikibrain.core.dao.LocalPageDao;
-import org.wikibrain.core.dao.RawPageDao;
+import org.wikibrain.core.dao.*;
 import org.wikibrain.core.lang.Language;
-import org.wikibrain.core.lang.LocalId;
+import org.wikibrain.core.model.CategoryGraph;
 import org.wikibrain.core.model.LocalPage;
-import org.wikibrain.core.model.RawPage;
-import org.wikibrain.matrix.DenseMatrix;
+import org.wikibrain.core.model.NameSpace;
 import org.wikibrain.pageview.PageViewDao;
 import org.wikibrain.sr.SRBuilder;
 import org.wikibrain.sr.SRMetric;
-import org.wikibrain.sr.SRResultList;
-import org.wikibrain.sr.vector.DenseVectorGenerator;
+import org.wikibrain.sr.SRResult;
 import org.wikibrain.sr.vector.DenseVectorSRMetric;
 
-import java.io.FileNotFoundException;
+import java.io.BufferedWriter;
+import java.io.FileWriter;
 import java.io.IOException;
-import java.io.PrintWriter;
-import java.io.UnsupportedEncodingException;
-import java.sql.SQLException;
-import java.util.ArrayList;
-import java.util.HashMap;
-import java.util.Map;
+import java.util.*;
 
 /**
  * @author Shilad Sen
  */
 public class Test {
+    private static final org.slf4j.Logger LOG = LoggerFactory.getLogger(Test.class);
 
-    static Logger log = Logger.getLogger(Test.class);
+    public static String [] TOP_LEVEL_CATS = {"Geography", "History", "Knowledge", "People", "Religion", "Science"};
 
     /**
      * This is a method to calibrate the model for word2vec.
@@ -50,122 +39,92 @@ public class Test {
       }
 
     public static void main(String args[]) throws Exception {
-        BasicConfigurator.configure();
         // Only do this once
-        buildWord2VecModel(); // comment this after first run
+//        Loader.main(new String[] { "-l", "simple", "-c", "wikiviz.conf" });
+//        if (true) return;
 
-//        Env env = EnvBuilder.envFromArgs(new String[]{"-c", "wb-map.conf"});
+//        buildWord2VecModel(); // comment this after first run
+        Env env = EnvBuilder.envFromArgs(new String[]{"-c", "wikiviz.conf"});
+
+        LocalPageDao pageDao = env.getConfigurator().get(LocalPageDao.class);
+        LocalLinkDao linkDao = env.getConfigurator().get(LocalLinkDao.class);
+        PageViewDao viewDao = env.getConfigurator().get(PageViewDao.class);
+        LocalCategoryMemberDao catDao = env.getConfigurator().get(LocalCategoryMemberDao.class);
+
+        Set<LocalPage> topCats = new HashSet<LocalPage>();
+        for (String c : TOP_LEVEL_CATS) {
+            LocalPage p = pageDao.getByTitle(Language.SIMPLE, NameSpace.CATEGORY, "Category:"+c);
+            if (p == null) {
+                LOG.warn("Couldn't find top level category for " + c);
+            } else {
+                topCats.add(p);
+            }
+        }
+
+        LOG.info("Loading views...");
+        DateTime now = new DateTime();
+        TIntIntMap views = viewDao.getAllViews(Language.SIMPLE, now.minusDays(1000), now);
+        int n = 0;
+        for (LocalPage p : pageDao.get(new DaoFilter().setNameSpaces(NameSpace.CATEGORY))) {
+            if (views.containsKey(p.getLocalId())) {
+                n++;
+            }
+        }
+        System.err.println("found page views for " + n + " cats");
+
+        BufferedWriter writer = new BufferedWriter(new FileWriter("articles.json"));
+        SRMetric sr = env.getConfigurator().get(SRMetric.class, "word2vec-wbmap", "language", "simple");
+        for (LocalPage p : pageDao.get(DaoFilter.normalPageFilter(Language.SIMPLE))) {
+            double pr = linkDao.getPageRank(Language.SIMPLE, p.getLocalId());
+            int v = views.get(p.getLocalId());
+            float[] vec = ((DenseVectorSRMetric)sr).getPageVector(p.getLocalId());
+            if (vec != null) {
+                writeJson(writer, p, v, pr, vec);
+            }
+        }
+
+        CategoryGraph graph = catDao.getGraph(Language.SIMPLE);
+        int numBigArticles = 0;
+        for (LocalPage cat : pageDao.get(new DaoFilter().setNameSpaces(NameSpace.CATEGORY))) {
+            // Get the minimum # of pageviews in here
+            Map<Integer, LocalPage> members = catDao.getCategoryMembers(cat);
+            if (members != null) {
+                float vec[] = new float[20];
+                int nArticles = 0;
+                for (LocalPage p2 : members.values()) {
+                    float[] v = ((DenseVectorSRMetric)sr).getPageVector(p2.getLocalId());
+                    if (v != null && p2.getNameSpace() == NameSpace.ARTICLE) {
+                        for (int j = 0; j < v.length; j++) vec[j] += v[j];
+                        nArticles++;
+                    }
+                }
+                if (nArticles > 10) {
+                    for (int j = 0; j < vec.length; j++) {
+                        vec[j] /= nArticles;
+                    }
+                    System.out.print("results for " + cat + ":");
+                    for (SRResult r : ((DenseVectorSRMetric)sr).mostSimilar(vec, 5, null)) {
+                        System.out.print(" " + pageDao.getById(Language.SIMPLE, r.getId()));
+                    }
+                    System.out.println();
+                    numBigArticles++;
+                    int v = views.get(cat.getLocalId());
+                    double pr = graph.catCosts[graph.catIdToIndex(cat.getLocalId())];
+                    writeJson(writer, cat, v, pr, vec);
+                }
+            }
+        }
+        writer.close();
     }
-//
-//    /**
-//     * This functiong gets and prints the most similar page in simple english to words from our input list.
-//     *
-//     * After playing around with this, I found it unsatisfactory for building groupings, as the pages were frequently
-//     * weird and/or inaccurate.
-//     *
-//     * TODO: Look into doing this on full english, which may have more accurate results.
-//     * @param env
-//     * @throws ConfigurationException
-//     * @throws DaoException
-//     */
-//    public static void getPages(Env env) throws ConfigurationException, DaoException {
-//        Configurator conf = env.getConfigurator();
-//        RawPageDao rpDao = conf.get(RawPageDao.class);
-//
-//        Language simple = Language.getByLangCode("simple");
-//
-//        SRMetric sr = conf.get(
-//                SRMetric.class, "milnewitten",
-//                "language", simple.getLangCode());
-//
-//        for (String s : wordList) {
-//            SRResultList similar = sr.mostSimilar(s, 4);
-//            try {
-//                System.out.print(s + " --> ");
-//                RawPage[] rps = new RawPage[4];
-//                for(int i = 0; i<4; i++){
-//                    RawPage rp = rpDao.getById(simple, similar.getId(i));
-//                    System.out.print(rp.getTitle() + ", ");
-//                }
-//                System.out.println();
-//            } catch (NullPointerException e) {
-//                System.out.println(s + " is null");
-//            }
-//
-////          rp.getPlainText(false)
-//        }
-//
-//    }
-//
-//    /**
-//     * This functiong gets the 20-dimensional vectors for each word from the given list in wikibrain.
-//     *
-//     * Possible TODO: Look into more/fewer dimensions, which could then be compressed similarly to how I'm doing now.
-//     * @param env
-//     * @throws ConfigurationException
-//     * @throws FileNotFoundException
-//     * @throws UnsupportedEncodingException
-//     */
-//    public static void getVectors(Env env) throws ConfigurationException, FileNotFoundException, UnsupportedEncodingException {
-//        DenseVectorSRMetric w2v = (DenseVectorSRMetric) env.getConfigurator().get(
-//                SRMetric.class, "word2vec-wbmap", "language", Language.SIMPLE.getLangCode());
-//        DenseVectorGenerator generator = w2v.getGenerator();
-//        Map<String, float[]> vectors = new HashMap<String, float[]>();
-//        for(String s : wordList){
-//            float[] vector = generator.getVector(s);
-//            if (vector != null){
-//                vectors.put(s, vector);
-//            }
-//        }
-//
-//        PrintWriter writer = new PrintWriter("points.txt",  "UTF-8");
-//        for(String w : vectors.keySet()) {
-//            writer.println("\"" + w + "\": [" + seeVector(vectors.get(w)) + "],");
-//        }
-//        writer.close();
-//    }
-//
-//    /**
-//     * This is an unfinished function that is meant to get the pageviews for a given word's most similar page. This will
-//     * also probably suffer the same issues as getPage() as the pages are frequently inaccurate and it uses the same
-//     * mechanism for getting pages as that function.
-//     * @param env
-//     * @throws ConfigurationException
-//     * @throws DaoException
-//     */
-//    public static void getPageViews(Env env) throws ConfigurationException, DaoException {
-//        PageViewDao viewDao = env.getConfigurator().get(PageViewDao.class);
-//        DateTime start = new DateTime(2015, 11, 15, 0, 0, 0);
-//        DateTime end = new DateTime(2015, 12, 1, 0, 0, 0);
-//        viewDao.ensureLoaded(start, end, env.getLanguages());
-//
-//        Configurator conf = env.getConfigurator();
-//        RawPageDao rpDao = conf.get(RawPageDao.class);
-//
-//        Language simple = Language.getByLangCode("simple");
-//
-//        SRMetric sr = conf.get(
-//                SRMetric.class, "milnewitten",
-//                "language", simple.getLangCode());
-//
-//        for (String s : wordList) {
-//            SRResultList similar = sr.mostSimilar(s, 1);
-//            try {
-//                System.out.print(s + " --> ");
-//                int views = viewDao.getNumViews(new LocalId(simple, similar.getId(0)), start, end);
-//                System.out.print(views);
-//            } catch (NullPointerException e) {
-//                System.out.println(s + " is null");
-//            }
-//            System.out.println();
-//        }
-//    }
-//
-//    public static String seeVector(float[] floats){
-//        String s = "";
-//        for(float f : floats){
-//            s += new Float(f).toString() + ", ";
-//        }
-//        return s.substring(0,s.length()-1);
-//    }
+
+    public static void writeJson(BufferedWriter writer, LocalPage page, int views, double pageRank, float [] vec) throws IOException {
+        JsonObject obj = new JsonObject();
+        JsonArray jsonVec = new JsonArray();
+        for (float x : vec) jsonVec.add(new JsonPrimitive(x));
+        obj.add("article", new JsonPrimitive(page.getTitle().toString()));
+        obj.add("views", new JsonPrimitive(views));
+        obj.add("pageRank", new JsonPrimitive(pageRank));
+        obj.add("vector", jsonVec);
+        writer.write(obj.toString() + "\n");
+    }
 }
